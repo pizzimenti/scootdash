@@ -18,12 +18,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.InputFilter
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.CompoundButton
 import android.widget.EditText
@@ -38,25 +38,32 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Listener {
+class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Listener, GpsCheck.Listener {
 
     private lateinit var prefs: SharedPreferences
     private val log = LogBook()
     private lateinit var link: Link
+    private lateinit var gps: GpsCheck
     private val main = Handler(Looper.getMainLooper())
 
     // live state
     private var status: Proto.Status? = null
-    private val limits = intArrayOf(-1, -1, -1, -1)          // km/h per gear, as last read
+    private val limits = intArrayOf(-1, -1, -1, -1)          // km/h per mode, as last read
     private val firstLimits = intArrayOf(-1, -1, -1, -1)     // first value read this session
     private val pendingLimit = intArrayOf(-1, -1, -1, -1)    // stepper values
+    private val askedLimit = intArrayOf(-1, -1, -1, -1)      // last value written
+    private val askedAt = LongArray(4)                       // when it was written
+    private val replyAt = LongArray(4)                       // when the scooter last answered
     private var mph = true
-    private var peakKmh = 0.0
+    private var peakRaw = 0.0                                // km/h as the scooter reports it
     private var syncing = false
     private var draggingAccel = false
     private var draggingBrake = false
     private var pendingAction = 0
     private var rawReg = -1
+    private var savedFactor = 1.0
+    private var applyFactor = false
+    private var shownMode = -2
 
     // header
     private lateinit var pager: PanelPager
@@ -69,15 +76,18 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
 
     // dash
     private lateinit var dial: DialView
+    private val modeCells = arrayOfNulls<LinearLayout>(4)
+    private val modeLabels = arrayOfNulls<TextView>(4)
+    private val modeCaps = arrayOfNulls<TextView>(4)
     private lateinit var rBattery: Readout
     private lateinit var rPower: Readout
     private lateinit var rAccel: Readout
     private lateinit var rBrake: Readout
     private lateinit var rTrip: Readout
     private lateinit var rOdo: Readout
-    private lateinit var rTripTime: Readout
-    private lateinit var rTotalTime: Readout
-    private lateinit var rLink: Readout
+    private lateinit var rGps: Readout
+    private lateinit var rFactor: Readout
+    private lateinit var rRaw: Readout
     private lateinit var tCruise: Telltale
     private lateinit var tZero: Telltale
     private lateinit var tLight: Telltale
@@ -88,9 +98,6 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
     private lateinit var macField: EditText
     private lateinit var connectBtn: TextView
     private lateinit var scanBtn: TextView
-    private val gearCells = arrayOfNulls<LinearLayout>(4)
-    private val gearNums = arrayOfNulls<TextView>(4)
-    private val gearCaps = arrayOfNulls<TextView>(4)
     private lateinit var accelBar: SeekBar
     private lateinit var accelVal: TextView
     private lateinit var brakeBar: SeekBar
@@ -99,12 +106,17 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
     private val switchRegs = intArrayOf(Proto.REG_CRUISE, Proto.REG_ZERO_START, Proto.REG_HEADLIGHT, Proto.REG_LOCK, Proto.REG_UNITS)
     private lateinit var pinField: EditText
     private lateinit var pinResult: TextView
+    private lateinit var gpsSwitch: Switch
+    private lateinit var gpsStatus: TextView
+    private lateinit var applySwitch: Switch
+    private lateinit var saveFactorBtn: TextView
     private val limitNow = arrayOfNulls<TextView>(4)
     private val limitEdit = arrayOfNulls<TextView>(4)
     private lateinit var regField: EditText
     private lateinit var valField: EditText
     private lateinit var regResult: TextView
     private lateinit var unitsSwitch: Switch
+    private lateinit var diagText: TextView
     private lateinit var logCount: TextView
     private lateinit var logPreview: TextView
 
@@ -114,22 +126,28 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         Ui.init(this)
         prefs = getSharedPreferences("scootdash", Context.MODE_PRIVATE)
         mph = prefs.getBoolean("mph", true)
+        savedFactor = prefs.getFloat("gpsFactor", 1f).toDouble()
+        applyFactor = prefs.getBoolean("applyFactor", false) && savedFactor != 1.0
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Ui.DUSK
         window.navigationBarColor = Ui.DUSK
         link = Link(this, log, this)
         link.address = prefs.getString("mac", Proto.DEFAULT_MAC) ?: Proto.DEFAULT_MAC
+        gps = GpsCheck(this, log)
+        gps.listener = this
         log.listener = this
         setContentView(buildRoot())
         log.event("app start, Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ") on " + Build.MODEL)
         refreshDash()
         refreshSetup()
+        refreshGps()
         main.postDelayed(ticker, 1_000)
         connectWithPermission()
     }
 
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
+        gps.stop()
         link.shutdown()
         super.onDestroy()
     }
@@ -218,14 +236,44 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         dial.mph = mph
         dial.isClickable = true
         dial.contentDescription = "Speedometer. Tap to reset the peak marker."
-        dial.setOnClickListener(object : View.OnClickListener {
-            override fun onClick(v: View) {
-                peakKmh = 0.0
-                refreshDash()
-                toast("Peak marker reset")
-            }
+        dial.setOnClickListener(click {
+            peakRaw = 0.0
+            refreshDash()
+            toast("Peak marker reset")
         })
         col.addView(dial, Ui.full())
+
+        // riding modes: the scooter's gears 0..3
+        val modes = Ui.row(this)
+        modes.setPadding(0, Ui.dp(4), 0, Ui.dp(6))
+        for (g in 0 until 4) {
+            val cell = Ui.column(this)
+            cell.setGravity(Gravity.CENTER)
+            cell.setPadding(0, Ui.dp(8), 0, Ui.dp(8))
+            val emoji = Ui.text(this, 24f, Ui.PUMICE, Ui.body)
+            emoji.text = MODE_EMOJI[g]
+            emoji.gravity = Gravity.CENTER
+            val name = Ui.text(this, 15f, Ui.PUMICE, Ui.bodySemi)
+            name.text = Proto.MODE_NAMES[g]
+            name.gravity = Gravity.CENTER
+            name.setPadding(0, Ui.dp(4), 0, 0)
+            val cap = Ui.text(this, 12.5f, Ui.SLATE, Ui.body)
+            cap.gravity = Gravity.CENTER
+            cell.addView(emoji, Ui.wrap())
+            cell.addView(name, Ui.wrap())
+            cell.addView(cap, Ui.wrap())
+            cell.isClickable = true
+            cell.contentDescription = Proto.MODE_NAMES[g] + " mode. While riding, touch and hold to switch."
+            cell.setOnClickListener(click { pickMode(g, false) })
+            cell.setOnLongClickListener(object : View.OnLongClickListener {
+                override fun onLongClick(v: View): Boolean { pickMode(g, true); return true }
+            })
+            modeCells[g] = cell; modeLabels[g] = name; modeCaps[g] = cap
+            val lp = Ui.weighted()
+            if (g > 0) lp.leftMargin = Ui.dp(8)
+            modes.addView(cell, lp)
+        }
+        col.addView(modes, Ui.full())
 
         rBattery = Readout(this, "Battery", 10)
         rAccel = Readout(this, "Acceleration", 9)
@@ -233,17 +281,17 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         rTrip = Readout(this, "Trip")
         rOdo = Readout(this, "Odometer")
         rPower = Readout(this, "Power")
-        rTripTime = Readout(this, "Trip timer")
-        rTotalTime = Readout(this, "Total timer")
-        rLink = Readout(this, "Link")
+        rGps = Readout(this, "GPS speed")
+        rFactor = Readout(this, "Scale factor")
+        rRaw = Readout(this, "Speed field")
         rTrip.note("since power-on")
-        rTripTime.note("counts")
-        rTotalTime.note("counts")
-        rLink.note("frames per second")
+        rGps.isClickable = true
+        rGps.background = Ui.ripple(Ui.box(0, 10f), 10f)
+        rGps.setOnClickListener(click { toggleGps(!gps.running) })
 
         col.addView(triple(rBattery, rAccel, rBrake), Ui.full())
         col.addView(triple(rTrip, rOdo, rPower), Ui.full())
-        col.addView(triple(rTripTime, rTotalTime, rLink), Ui.full())
+        col.addView(triple(rGps, rFactor, rRaw), Ui.full())
 
         val lamps = FlowRow(this, 8, 8)
         lamps.setPadding(0, Ui.dp(12), 0, 0)
@@ -289,29 +337,6 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         col.addView(connRow, Ui.full())
         col.addView(caption("The scooter in the original capture was " + Proto.DEFAULT_MAC + ". Find scooter scans for anything named 365Bluetooth."))
 
-        // gear
-        col.addView(heading("Gear", "The button on the scooter cycles gears 1 to 3. Gear 0 is only reachable from the app."))
-        val gears = Ui.row(this)
-        for (g in 0 until 4) {
-            val cell = Ui.column(this)
-            cell.setGravity(Gravity.CENTER)
-            cell.setPadding(0, Ui.dp(10), 0, Ui.dp(10))
-            val n = Ui.text(this, 28f, Ui.PUMICE, Ui.condSemi)
-            n.text = g.toString()
-            n.gravity = Gravity.CENTER
-            val cap = Ui.text(this, 13f, Ui.SLATE, Ui.body)
-            cap.gravity = Gravity.CENTER
-            cell.addView(n, Ui.wrap())
-            cell.addView(cap, Ui.wrap())
-            cell.isClickable = true
-            cell.setOnClickListener(click { command(Proto.writeRegister(Proto.REG_GEAR, g)) })
-            gearCells[g] = cell; gearNums[g] = n; gearCaps[g] = cap
-            val lp = Ui.weighted()
-            if (g > 0) lp.leftMargin = Ui.dp(8)
-            gears.addView(cell, lp)
-        }
-        col.addView(gears, Ui.full())
-
         // ride feel
         col.addView(heading("Ride feel", "Sent when you let go of the slider. The stock app used levels 3 to 9."))
         accelVal = Ui.text(this, 22f, Ui.PUMICE, Ui.condSemi)
@@ -337,8 +362,14 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
 
         // switches
         col.addView(heading("Switches", "Names are my best reading of the capture. Flip one and watch the scooter to confirm it."))
-        val names = arrayOf("Cruise control", "Zero start", "Headlight", "Lock", "Units flag (mph)")
+        val names = arrayOf("Cruise control", "Zero start", "Headlight", "Lock", "Units (on = mph)")
         for (i in 0 until 5) col.addView(switchRow(i, names[i]), Ui.full())
+
+        // GPS check
+        col.addView(buildGpsSection())
+
+        // speed limits per mode
+        col.addView(buildLimits())
 
         // password
         col.addView(heading("Password", "The stock app sent 000000 right after turning Lock on, and the scooter accepted it."))
@@ -355,9 +386,6 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         col.addView(pwRow, Ui.full())
         pinResult = caption("")
         col.addView(pinResult)
-
-        // top speed experiment
-        col.addView(buildTopSpeed())
 
         // raw register
         col.addView(heading("Raw register", "Read sends <reg> FF. Write sends <reg> <value>. Values are hex."))
@@ -400,15 +428,23 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
                 dial.mph = checked
                 refreshDash()
                 refreshSetup()
+                refreshGps()
             }
         })
         uRow.addView(unitsSwitch, Ui.wrap())
         uRow.setPadding(0, Ui.dp(6), 0, Ui.dp(6))
         col.addView(uRow, Ui.full())
-        col.addView(caption("This app assumes the scooter's speed field is km/h × 10. If it disagrees with the scooter's display, the copied log will show by how much."))
+        col.addView(caption("With its units switch on, the scooter sends speed as mph × 10 (whole mph only) and distance in thousandths of a mile. With it off, it should send km/h and km instead. This switch only changes how ScootDash shows them."))
+
+        // diagnostics
+        col.addView(heading("Diagnostics", null))
+        diagText = caption("")
+        diagText.typeface = Typeface.MONOSPACE
+        diagText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+        col.addView(diagText)
 
         // log
-        col.addView(heading("Log", "Copies the recent back-and-forth with the scooter so you can paste it into an issue or a chat."))
+        col.addView(heading("Log", "Copies the recent back-and-forth with the scooter, plus GPS lines when the GPS check is on, so you can paste it into a chat."))
         val logBtns = Ui.row(this)
         val copy = Ui.button(this, "Copy log", Ui.PRIMARY)
         copy.setOnClickListener(click { copyLog() })
@@ -428,13 +464,73 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         lpLp.topMargin = Ui.dp(8)
         col.addView(logPreview, lpLp)
 
-        val about = caption("ScootDash 1.0. Built from a decoded capture of the stock 365Scooter app. Unofficial and unsupported, so test changes standing still.")
+        val about = caption("ScootDash 1.1. Built from a decoded capture of the stock 365Scooter app. Unofficial and unsupported, so test changes standing still.")
         about.setPadding(0, Ui.dp(28), 0, 0)
         col.addView(about)
         return scroller(col)
     }
 
-    private fun buildTopSpeed(): View {
+    private fun buildGpsSection(): View {
+        val block = Ui.column(this)
+        block.addView(heading("GPS check", "Once a second, ScootDash logs how far GPS says you went and how fast, next to what the scooter reported for the same second. From that it works out the scale factor: ×0.88 would mean the scooter reads 14 % high. Ride a few minutes under open sky, above 8 mph (13 km/h), and vary your speed: the scooter only reports whole mph, and at one steady speed that rounding never averages out. Only distances go in the log, never your coordinates."))
+        val row = Ui.row(this)
+        row.setPadding(0, Ui.dp(6), 0, Ui.dp(6))
+        val l = Ui.text(this, 17f, Ui.PUMICE, Ui.bodyMedium)
+        l.text = "Compare with GPS"
+        row.addView(l, Ui.weighted())
+        gpsSwitch = Switch(this)
+        tintSwitch(gpsSwitch)
+        gpsSwitch.setOnCheckedChangeListener(object : CompoundButton.OnCheckedChangeListener {
+            override fun onCheckedChanged(b: CompoundButton, checked: Boolean) {
+                if (syncing) return
+                toggleGps(checked)
+            }
+        })
+        row.addView(gpsSwitch, Ui.wrap())
+        block.addView(row, Ui.full())
+        gpsStatus = caption("")
+        block.addView(gpsStatus)
+
+        val btns = Ui.row(this)
+        btns.setPadding(0, Ui.dp(10), 0, 0)
+        saveFactorBtn = Ui.button(this, "Save factor")
+        saveFactorBtn.setOnClickListener(click { saveFactor() })
+        val reset = Ui.button(this, "Reset totals")
+        reset.setOnClickListener(click { gps.reset() })
+        btns.addView(saveFactorBtn, Ui.weighted())
+        btns.addView(spacer(10), LinearLayout.LayoutParams(Ui.dp(10), 1))
+        btns.addView(reset, Ui.weighted())
+        block.addView(btns, Ui.full())
+
+        val aRow = Ui.row(this)
+        aRow.setPadding(0, Ui.dp(12), 0, Ui.dp(4))
+        val al = Ui.text(this, 17f, Ui.PUMICE, Ui.bodyMedium)
+        al.text = "Correct speed and distance with the saved factor"
+        aRow.addView(al, Ui.weighted())
+        applySwitch = Switch(this)
+        tintSwitch(applySwitch)
+        applySwitch.isChecked = applyFactor
+        applySwitch.setOnCheckedChangeListener(object : CompoundButton.OnCheckedChangeListener {
+            override fun onCheckedChanged(b: CompoundButton, checked: Boolean) {
+                if (syncing) return
+                if (checked && savedFactor == 1.0) {
+                    toast("Save a factor first")
+                    syncing = true; b.isChecked = false; syncing = false
+                    return
+                }
+                applyFactor = checked
+                prefs.edit().putBoolean("applyFactor", checked).apply()
+                log.event("GPS correction " + (if (checked) "on, x" + fmt3(savedFactor) else "off"))
+                refreshDash()
+                refreshGps()
+            }
+        })
+        aRow.addView(applySwitch, Ui.wrap())
+        block.addView(aRow, Ui.full())
+        return block
+    }
+
+    private fun buildLimits(): View {
         val block = Ui.column(this)
         val edge = android.graphics.drawable.GradientDrawable()
         edge.setColor(Ui.alpha(Ui.CAUTION, 0x10))
@@ -445,7 +541,7 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         val lp = Ui.full()
         lp.topMargin = Ui.dp(28)
         block.layoutParams = lp
-        val h = heading("Top speed per gear", "The stock app only ever reads these. Writing one is the experiment: the scooter may ignore it, keep it until power-off, or keep it for good. Every write is read back, and the log records both.")
+        val h = heading("Speed limit per mode", "The scooter answers every write with the value it kept. Lower values stick. Anything above 31 km/h is clamped: asking Drive for 42 while it sat at 14 set it to 31. Still untested: whether another mode can go above its factory value while staying under 31, for example Bike at 25 (factory 18).")
         (h.layoutParams as LinearLayout.LayoutParams).topMargin = Ui.dp(14)
         block.addView(h)
         for (g in 0 until 4) {
@@ -453,7 +549,7 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
             row.setPadding(0, Ui.dp(10), 0, Ui.dp(4))
             val info = Ui.column(this)
             val name = Ui.text(this, 17f, Ui.PUMICE, Ui.bodySemi)
-            name.text = "Gear $g"
+            name.text = MODE_EMOJI[g] + " " + Proto.MODE_NAMES[g]
             val now = Ui.text(this, 13f, Ui.SLATE, Ui.body)
             info.addView(name)
             info.addView(now)
@@ -614,6 +710,21 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         return true
     }
 
+    /**
+     * The mode buttons sit right under the dial, and Walk caps the scooter at a few km/h.
+     * So while you're moving, a tap only explains itself and a touch-and-hold switches.
+     * "Moving" goes by the last frame received, even a stale one: right after a Bluetooth
+     * reconnect is exactly when you're likely to still be riding.
+     */
+    private fun pickMode(g: Int, held: Boolean) {
+        val s = status
+        if (!held && s != null && s.speedKmh >= MOVING_KMH && s.gear != g) {
+            toast("While riding, touch and hold " + Proto.MODE_NAMES[g] + " to switch")
+            return
+        }
+        command(Proto.writeRegister(Proto.REG_GEAR, g))
+    }
+
     private fun onConnectButton() {
         val s = link.state
         if (s == Link.READY || s == Link.CONNECTING || s == Link.WAITING || s == Link.SCANNING) {
@@ -643,20 +754,32 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         val reg = Proto.TOP_SPEED_REG[g]
         val back = if (firstLimits[g] >= 0) " To undo, write " + firstLimits[g] + "." else ""
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("Write gear $g top speed?")
-            .setMessage("Sends register 0x" + Proto.hex2(reg) + " = " + v + " km/h (" + fmt1(v * 0.621371) + " mph). " +
-                "Do this with the wheel off the ground. The app reads the value back afterwards." + back)
+            .setTitle("Set " + Proto.MODE_NAMES[g] + " to $v km/h?")
+            .setMessage("Sends register 0x" + Proto.hex2(reg) + " = " + v + " km/h (" + fmt1(v / Proto.MI_KM) + " mph). " +
+                "Do this standing still. The scooter answers with the value it kept." + back)
             .setPositiveButton("Write", object : DialogInterface.OnClickListener {
                 override fun onClick(d: DialogInterface, which: Int) {
                     if (!command(Proto.writeRegister(reg, v))) return
-                    log.event("user wrote gear $g top speed $v km/h (was " + limits[g] + ")")
+                    askedLimit[g] = v
+                    askedAt[g] = SystemClock.elapsedRealtime()
+                    log.event("user asked " + Proto.modeTag(g) + " for $v km/h (was " + limits[g] + ")")
                     readBack(reg, 400)
                     readBack(reg, 1_500)
+                    refreshSetup()
+                    main.removeCallbacks(refreshSetupLater)
+                    main.postDelayed(refreshSetupLater, LIMIT_REPLY_MS + 100)
                 }
             })
             .setNegativeButton("Cancel", null)
             .show()
     }
+
+    /** Turns "waiting…" into "no reply" if the scooter never answers a limit write. */
+    private val refreshSetupLater = object : Runnable {
+        override fun run() { refreshSetup() }
+    }
+
+    private fun limitWaiting(g: Int): Boolean = askedLimit[g] >= 0 && replyAt[g] < askedAt[g]
 
     private fun readBack(reg: Int, delay: Long) {
         main.postDelayed(object : Runnable {
@@ -699,9 +822,89 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
             .show()
     }
 
+    // ------------------------------------------------------------- GPS check
+    private fun toggleGps(on: Boolean) {
+        if (!on) {
+            gps.stop()
+            log.quietStatus = false
+            refreshGps()
+            return
+        }
+        val need = missingLocation()
+        if (need.isNotEmpty()) { pendingAction = ACTION_GPS; requestPermissions(need, REQ_PERMS); refreshGps(); return }
+        if (!gps.gpsEnabled()) {
+            toast("Turn on Location, then try again")
+            try { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) } catch (e: RuntimeException) { }
+            refreshGps()
+            return
+        }
+        if (gps.start()) log.quietStatus = true
+        refreshGps()
+    }
+
+    private fun saveFactor() {
+        val k = gps.speedFactor
+        if (k.isNaN() || gps.goodSeconds < 30) { toast("Ride at least 30 counted seconds first"); return }
+        savedFactor = k
+        prefs.edit().putFloat("gpsFactor", k.toFloat()).apply()
+        log.event("saved GPS factor x" + fmt3(k) + " from " + gps.goodSeconds + " s. " + gps.summary())
+        toast("Saved ×" + fmt3(k) + ": scooter " + GpsCheck.readsText(k))
+        refreshGps()
+        refreshDash()
+    }
+
+    override fun onGps() {
+        refreshGps()
+    }
+
+    private fun refreshGps() {
+        if (!this::gpsStatus.isInitialized) return
+        syncing = true
+        if (gpsSwitch.isChecked != gps.running) gpsSwitch.isChecked = gps.running
+        if (applySwitch.isChecked != applyFactor) applySwitch.isChecked = applyFactor
+        syncing = false
+        val k = gps.speedFactor
+        val sb = StringBuilder()
+        if (!gps.running) sb.append("Off.")
+        else if (gps.lastFixAt == 0L) sb.append("Waiting for a GPS fix…")
+        else {
+            val age = (SystemClock.elapsedRealtime() - gps.lastFixAt) / 1000
+            sb.append("Fix ").append(if (age <= 2) "live" else "$age s old").append(", accuracy ")
+                .append(if (gps.accuracy >= 0) fmt0(gps.accuracy.toDouble()) + " m" else "unknown").append('.')
+        }
+        sb.append(' ').append(gps.goodSeconds).append(" seconds counted")
+        if (!k.isNaN()) sb.append(", scooter speed ×").append(fmt3(k))
+        val kd = gps.distanceFactor
+        if (!kd.isNaN()) sb.append(", distance ×").append(fmt3(kd))
+        sb.append('.')
+        if (savedFactor != 1.0) sb.append(" Saved factor ×").append(fmt3(savedFactor)).append(if (applyFactor) ", applied." else ", not applied.")
+        gpsStatus.text = sb.toString()
+        saveFactorBtn.alpha = if (!k.isNaN() && gps.goodSeconds >= 30) 1f else 0.5f
+
+        // dash tiles
+        if (gps.running && gps.gpsKmh >= 0 && SystemClock.elapsedRealtime() - gps.lastFixAt < 3_000) {
+            rGps.value.text = fmt1(dispSpeed(gps.gpsKmh))
+            rGps.note(unitName() + ", acc " + (if (gps.accuracy >= 0) fmt0(gps.accuracy.toDouble()) else "?") + " m")
+        } else {
+            rGps.value.text = "—"
+            rGps.note(if (gps.running) "waiting for fix" else "tap to start")
+        }
+        if (!k.isNaN()) {
+            rFactor.value.text = "×" + fmt2(k)
+            rFactor.note("scooter " + GpsCheck.readsText(k))
+        } else if (savedFactor != 1.0) {
+            rFactor.value.text = "×" + fmt2(savedFactor)
+            rFactor.note(if (applyFactor) "saved, applied" else "saved")
+        } else {
+            rFactor.value.text = "—"
+            rFactor.note("needs GPS riding")
+        }
+    }
+
+    // ------------------------------------------------------------ copy log
     private fun copyLog() {
         val sb = StringBuilder()
-        sb.append("ScootDash log (app 1.0, Android ").append(Build.VERSION.RELEASE).append(" / API ")
+        sb.append("ScootDash log (app 1.1, Android ").append(Build.VERSION.RELEASE).append(" / API ")
             .append(Build.VERSION.SDK_INT).append(", ").append(Build.MODEL).append(")\n")
         sb.append("copied ").append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
             .append(", link: ").append(linkText.text).append(", device ").append(link.deviceName).append(' ').append(link.address).append('\n')
@@ -709,16 +912,20 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
             .append(fmt1(link.framesPerSecond)).append("/s\n")
         val s = status
         if (s != null) sb.append("now: ").append(Proto.describeRx(s)).append("\n      plain ").append(Proto.hex(s.plain)).append('\n')
-        sb.append("top speed km/h by gear: ")
+        sb.append("speed limit km/h by mode: ")
         for (g in 0 until 4) {
-            sb.append("g").append(g).append('=').append(limits[g])
+            sb.append(Proto.MODE_NAMES[g]).append('=').append(limits[g])
             if (firstLimits[g] >= 0 && firstLimits[g] != limits[g]) sb.append(" (was ").append(firstLimits[g]).append(')')
+            if (limitWaiting(g)) sb.append(" (asked ").append(askedLimit[g]).append(", no reply yet)")
+            else if (askedLimit[g] >= 0 && askedLimit[g] != limits[g]) sb.append(" (asked ").append(askedLimit[g]).append(')')
             if (g < 3) sb.append(", ")
         }
-        val text = log.export(sb.toString(), 600)
+        sb.append("\ngps: ").append(if (gps.running) "on" else "off").append(", ").append(gps.summary())
+            .append(", saved factor x").append(fmt3(savedFactor)).append(if (applyFactor) " (applied)" else " (not applied)")
+        val text = log.export(sb.toString(), EXPORT_LINES)
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("ScootDash log", text))
-        toast("Copied " + Math.min(600, log.size) + " log lines")
+        toast("Copied " + Math.min(EXPORT_LINES, log.size) + " log lines")
     }
 
     // ----------------------------------------------------------- permissions
@@ -736,6 +943,17 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
             want.add(Manifest.permission.ACCESS_COARSE_LOCATION)
             want.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+        return notGranted(want)
+    }
+
+    private fun missingLocation(): Array<String?> {
+        val want = ArrayList<String>()
+        want.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        want.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        return notGranted(want)
+    }
+
+    private fun notGranted(want: ArrayList<String>): Array<String?> {
         val miss = ArrayList<String>()
         for (p in want) if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) miss.add(p)
         val out = arrayOfNulls<String>(miss.size)
@@ -777,10 +995,19 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         for (r in grantResults) if (r != PackageManager.PERMISSION_GRANTED) all = false
         if (!all) {
             log.error("permission denied: " + permissions.size + " requested")
+            if (pendingAction == ACTION_GPS) {
+                toast("The GPS check needs precise location")
+                refreshGps()
+                return
+            }
             onLinkState(Link.FAILED, "Needs Nearby devices permission" + if (pendingAction == ACTION_SCAN) " and Location to scan" else "")
             return
         }
-        if (pendingAction == ACTION_SCAN) scanWithPermission() else connectWithPermission()
+        when (pendingAction) {
+            ACTION_SCAN -> scanWithPermission()
+            ACTION_GPS -> toggleGps(true)
+            else -> connectWithPermission()
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -819,8 +1046,8 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
 
     override fun onStatus(s: Proto.Status) {
         status = s
-        val kmh = s.speedX10 / 10.0
-        if (kmh > peakKmh) peakKmh = kmh
+        gps.onScooter(s)
+        if (s.speedKmh > peakRaw) peakRaw = s.speedKmh
         refreshDash()
         syncSetup(s)
     }
@@ -830,10 +1057,13 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
             val g = m.gearForTopSpeed
             if (g >= 0) {
                 val changed = limits[g] != m.value
+                val wasWaiting = limitWaiting(g)
                 limits[g] = m.value
+                replyAt[g] = SystemClock.elapsedRealtime()
                 if (firstLimits[g] < 0) firstLimits[g] = m.value
                 if (pendingLimit[g] < 0) pendingLimit[g] = m.value
-                if (changed) { refreshDash(); refreshSetup() }
+                if (changed) refreshDash()
+                if (changed || wasWaiting) refreshSetup()
             }
             if (m.reg == rawReg) regResult.text = "Register 0x" + Proto.hex2(m.reg) + " = " + m.value + " (0x" + Proto.hex2(m.value) + ")"
         } else if (m is Proto.PwReply) {
@@ -852,7 +1082,7 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
 
     override fun onLogChanged() {
         if (!this::logCount.isInitialized) return
-        logCount.text = "" + log.size + " lines recorded. Copy takes the newest 600."
+        logCount.text = "" + log.size + " lines recorded. Copy takes the newest " + EXPORT_LINES + "."
         val sb = StringBuilder()
         for (l in log.tail(8)) {
             if (sb.isNotEmpty()) sb.append('\n')
@@ -866,10 +1096,10 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         override fun run() {
             if (link.state == Link.READY) {
                 val age = SystemClock.elapsedRealtime() - link.lastFrameAt
-                linkRate.text = if (age > 2_000) "no data " + (age / 1000) + " s" else ""
-                if (this@MainActivity::rLink.isInitialized) rLink.value.text = if (age > 2_000) "stale" else fmt1(link.framesPerSecond)
+                linkRate.text = if (age > 2_000) "no data " + (age / 1000) + " s" else fmt1(link.framesPerSecond) + "/s"
                 refreshDash()
             } else linkRate.text = ""
+            refreshGps()
             main.postDelayed(this, 1_000)
         }
     }
@@ -880,27 +1110,37 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         return if (m > 0) m else 31
     }
 
+    /** A speed or distance as shown: the scooter's value, times the saved GPS factor when that's on. */
+    private fun corrected(v: Double): Double = if (applyFactor) v * savedFactor else v
+
     private fun refreshDash() {
         val s = status
         val ready = link.state == Link.READY && s != null && link.lastFrameAt > link.connectedAt
         val age = SystemClock.elapsedRealtime() - link.lastFrameAt
         dial.connected = ready && age < 3_000
         dial.mph = mph
-        dial.maxKmh = maxLimit().toDouble()
+        dial.maxKmh = corrected(maxLimit().toDouble())
         if (s != null) {
-            dial.speedKmh = s.speedX10 / 10.0
+            dial.speedKmh = corrected(s.speedKmh)
             dial.gear = s.gear
             dial.cruise = s.cruise
             dial.locked = s.lock
-            dial.capKmh = if (s.gear in 0..3 && limits[s.gear] > 0) limits[s.gear].toDouble() else -1.0
+            dial.capKmh = if (s.gear in 0..3 && limits[s.gear] > 0) corrected(limits[s.gear].toDouble()) else -1.0
             if (ready) {
+                val mode = if (s.gear in 0..3) MODE_EMOJI[s.gear] + " " + Proto.MODE_NAMES[s.gear] else "Mode ?"
                 dial.stateText = if (age >= 3_000) "No data for " + (age / 1000) + " s"
-                else if (dial.capKmh > 0) "Gear " + s.gear + ", limited to " + speedText(dial.capKmh)
-                else "Gear " + s.gear
+                else if (dial.capKmh > 0) mode + ", up to " + speedText(dial.capKmh)
+                else mode
             }
         }
-        dial.peakKmh = peakKmh
+        dial.peakKmh = corrected(peakRaw)
         dial.invalidate()
+        val sel = if (s != null && dial.connected) s.gear else -1
+        if (sel != shownMode) {
+            shownMode = sel
+            for (g in 0 until 4) styleMode(g, sel == g)
+        }
+        for (g in 0 until 4) modeCaps[g]?.text = if (limits[g] > 0) speedText(corrected(limits[g].toDouble())) else "–"
 
         if (s == null) return
         rBattery.value.text = "" + s.battery + "%"
@@ -916,15 +1156,31 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         rAccel.bar?.set(s.accel / 9f, Ui.PUMICE)
         rBrake.value.text = "" + s.brake
         rBrake.bar?.set(s.brake / 9f, Ui.PUMICE)
-        rTrip.value.text = distText(s.tripMeters, 2)
-        rOdo.value.text = distText(s.odoMeters, 1)
-        rTripTime.value.text = String.format(Locale.US, "%,d", s.tripTime)
-        rTotalTime.value.text = String.format(Locale.US, "%,d", s.totalTime)
+        rTrip.value.text = distText(corrected(s.tripMeters), 2)
+        rOdo.value.text = distText(corrected(s.odoMeters), 1)
+        rRaw.value.text = "" + s.speedRaw
+        rRaw.note("= " + fmt1(s.speedRaw / 10.0) + " " + s.speedUnit + (if (applyFactor) ", shown ×" + fmt2(savedFactor) else ""))
         tCruise.setOn(s.cruise)
         tZero.setOn(s.zeroStart)
         tLight.setOn(s.headlight)
         tLock.setOn(s.lock)
         tUnits.setOn(s.unitsFlag)
+        if (this::diagText.isInitialized) {
+            diagText.text = "speed field  " + s.speedRaw + " = " + fmt1(s.speedRaw / 10.0) + " " + s.speedUnit +
+                "\ntrip         " + s.tripRaw + " × 0.001 " + (if (s.unitsFlag) "mi" else "km") +
+                "\nodometer     " + s.odoRaw + " × 0.001 " + (if (s.unitsFlag) "mi" else "km") +
+                "\ntrip timer   " + String.format(Locale.US, "%,d", s.tripTime) + " counts" +
+                "\ntotal timer  " + String.format(Locale.US, "%,d", s.totalTime) + " counts" +
+                "\nbytes 6–7    " + s.reserved67 +
+                "\nframes       " + fmt1(link.framesPerSecond) + " per second"
+        }
+    }
+
+    private fun styleMode(g: Int, on: Boolean) {
+        val cell = modeCells[g] ?: return
+        cell.background = Ui.ripple(if (on) Ui.box(Ui.PUMICE, 12f) else Ui.box(Ui.BASALT, 12f, 1f, Ui.RIDGE), 12f)
+        modeLabels[g]?.setTextColor(if (on) Ui.DUSK else Ui.PUMICE)
+        modeCaps[g]?.setTextColor(if (on) Ui.DUSK else Ui.SLATE)
     }
 
     private fun syncSetup(s: Proto.Status) {
@@ -937,7 +1193,6 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         if (!draggingAccel && s.accel in 1..9) { accelBar.progress = s.accel - 1; accelVal.text = "" + s.accel }
         if (!draggingBrake && s.brake in 1..9) { brakeBar.progress = s.brake - 1; brakeVal.text = "" + s.brake }
         syncing = false
-        for (g in 0 until 4) styleGear(g, s.gear == g)
     }
 
     private fun resyncSliders() {
@@ -947,37 +1202,40 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
     }
 
     private fun refreshSetup() {
+        val t = SystemClock.elapsedRealtime()
         for (g in 0 until 4) {
-            val cap = gearCaps[g] ?: continue
-            cap.text = if (limits[g] > 0) speedText(limits[g].toDouble()) else "limit ?"
             val now = limitNow[g] ?: continue
-            now.text = if (limits[g] > 0) {
-                val was = if (firstLimits[g] >= 0 && firstLimits[g] != limits[g]) ", was " + firstLimits[g] else ""
-                "Now " + limits[g] + " km/h (" + fmt1(limits[g] * 0.621371) + " mph)" + was + ". Register 0x" + Proto.hex2(Proto.TOP_SPEED_REG[g])
-            } else "Not read yet. Register 0x" + Proto.hex2(Proto.TOP_SPEED_REG[g])
+            val sb = StringBuilder()
+            if (limits[g] > 0) sb.append("Now ").append(limits[g]).append(" km/h (").append(fmt1(limits[g] / Proto.MI_KM)).append(" mph)")
+            else sb.append("Not read yet")
+            if (limitWaiting(g)) {
+                sb.append(", asked ").append(askedLimit[g]).append(if (t - askedAt[g] < LIMIT_REPLY_MS) ", waiting…" else ", no reply")
+            } else if (askedLimit[g] >= 0 && askedLimit[g] != limits[g]) {
+                sb.append(", asked ").append(askedLimit[g]).append(", kept ").append(limits[g])
+            }
+            if (limits[g] > 0 && firstLimits[g] >= 0 && firstLimits[g] != limits[g]) sb.append(", was ").append(firstLimits[g])
+            sb.append(". Register 0x").append(Proto.hex2(Proto.TOP_SPEED_REG[g]))
+            now.text = sb.toString()
             limitEdit[g]?.text = if (pendingLimit[g] > 0) pendingLimit[g].toString() else "–"
-            styleGear(g, status?.gear == g)
         }
     }
 
-    private fun styleGear(g: Int, on: Boolean) {
-        val cell = gearCells[g] ?: return
-        cell.background = Ui.ripple(if (on) Ui.box(Ui.PUMICE, 12f) else Ui.box(Ui.BASALT, 12f, 1f, Ui.RIDGE), 12f)
-        gearNums[g]?.setTextColor(if (on) Ui.DUSK else Ui.PUMICE)
-        gearCaps[g]?.setTextColor(if (on) Ui.DUSK else Ui.SLATE)
-    }
-
     // --------------------------------------------------------------- format
-    private fun speedText(kmh: Double): String =
-        if (mph) fmt0(kmh * 0.621371) + " mph" else fmt0(kmh) + " km/h"
+    private fun dispSpeed(kmh: Double): Double = if (mph) kmh / Proto.MI_KM else kmh
 
-    private fun distText(m: Long, decimals: Int): String {
+    private fun unitName(): String = if (mph) "mph" else "km/h"
+
+    private fun speedText(kmh: Double): String = fmt0(dispSpeed(kmh)) + " " + unitName()
+
+    private fun distText(m: Double, decimals: Int): String {
         val f = "%." + decimals + "f"
         return if (mph) String.format(Locale.US, "$f mi", m / 1609.344) else String.format(Locale.US, "$f km", m / 1000.0)
     }
 
     private fun fmt0(v: Double): String = String.format(Locale.US, "%.0f", v)
     private fun fmt1(v: Double): String = String.format(Locale.US, "%.1f", v)
+    private fun fmt2(v: Double): String = String.format(Locale.US, "%.2f", v)
+    private fun fmt3(v: Double): String = String.format(Locale.US, "%.3f", v)
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
@@ -986,6 +1244,18 @@ class MainActivity : Activity(), Link.Listener, LogBook.Listener, PanelPager.Lis
         const val REQ_BT = 8
         const val ACTION_CONNECT = 1
         const val ACTION_SCAN = 2
+        const val ACTION_GPS = 3
         const val MAX_WRITE_KMH = 45
+        const val EXPORT_LINES = 1500
+        /** Above this, a tap on a mode button only explains; touch and hold switches. */
+        const val MOVING_KMH = 5.0
+        const val LIMIT_REPLY_MS = 4_000L
+
+        /** 🚶‍♀️ 🏃‍♀️ 🚴‍♀️ 🛵 for gears 0..3 */
+        val MODE_EMOJI = arrayOf(
+            "🚶‍♀️",
+            "🏃‍♀️",
+            "🚴‍♀️",
+            "🛵")
     }
 }

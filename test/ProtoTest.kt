@@ -35,9 +35,17 @@ fun main(args: Array<String>) {
         }
     }
     val f = first!!
-    check(f.gear == 3 && f.battery == 100 && f.odoMeters == 99390L && f.tripMeters == 840L && f.accel == 7 && f.brake == 7)
+    check(f.gear == 3 && f.battery == 100 && f.odoRaw == 99390L && f.tripRaw == 840L && f.accel == 7 && f.brake == 7)
     check(f.cruise && f.unitsFlag && f.zeroStart && !f.headlight && !f.lock)
-    check(Proto.describeTx(Proto.writeRegister(Proto.TOP_SPEED_REG[3], 33)) == "WRITE gear 3 top speed = 33 km/h")
+    check(Proto.describeTx(Proto.writeRegister(Proto.TOP_SPEED_REG[3], 33)) == "WRITE Drive (gear 3) limit = 33 km/h")
+    check(Proto.describeRx(Proto.parse(Proto.encrypt(Proto.parseHex("db eb ba 2a 1f")))) == "Drive (gear 3) limit = 31 km/h")
+    // A frame from the 2026-10-08 ride: Drive mode held at its 31 km/h limit, units flag set.
+    val ride = Proto.parse(Proto.encrypt(Proto.parseHex("db eb fa db 3b 41 00 00 be 00 64 4e 01 00 00 20 6d 01 00 c6 02 00 00 ae 87 01 00 09 09")))
+    check(ride is Proto.Status && ride.speedRaw == 190 && ride.unitsFlag && ride.speedUnit == "mph")
+    ride as Proto.Status
+    check(Math.abs(ride.speedKmh - 30.577) < 0.01) { "speed ${ride.speedKmh}" }       // 19.0 mph ~ 31 km/h limit
+    check(Math.abs(ride.odoMeters - 100270 * 1.609344) < 0.5)
+    println("ride frame: " + Proto.describeRx(ride))
     println("TX rebuilt $tx, RX parsed $rx (status $status, replies $replies, password $pw)")
     println("first: " + Proto.describeRx(f))
     println("sample TX: " + Proto.describeTx(Proto.readRegister(0xA2)) + " | " + Proto.describeTx(Proto.password("000000")))

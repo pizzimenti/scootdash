@@ -3,6 +3,7 @@
     package="io.github.pizzimenti.scootdash">
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
 
     <!-- Android 12 and newer: connect to the scooter, and scan when you tap Find scooter -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />

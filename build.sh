@@ -16,8 +16,8 @@ KOTLINC="${KOTLINC:-$(command -v kotlinc || true)}"
 KOTLIN_HOME="${KOTLIN_HOME:-$(cd "$(dirname "$(readlink -f "$KOTLINC")")/.." && pwd)}"
 KOTLIN_STDLIB="${KOTLIN_STDLIB:-$KOTLIN_HOME/lib/kotlin-stdlib.jar}"
 KEYSTORE="${KEYSTORE:-keystore/scootdash-debug.jks}"
-VERSION_CODE="${VERSION_CODE:-1}"
-VERSION_NAME="${VERSION_NAME:-1.0}"
+VERSION_CODE="${VERSION_CODE:-2}"
+VERSION_NAME="${VERSION_NAME:-1.1}"
 OUT=build
 
 for v in ANDROID_JAR BUILD_TOOLS KOTLINC KOTLIN_STDLIB; do

@@ -14,6 +14,8 @@ class LogBook {
     interface Listener { fun onLogChanged() }
 
     var listener: Listener? = null
+    /** While riding with the GPS check on, log status frames only when a setting changes. */
+    var quietStatus = false
     private val lines = ArrayDeque<String>()
     private var t0 = SystemClock.elapsedRealtime()
     private var lastStatus: Proto.Status? = null
@@ -37,6 +39,10 @@ class LogBook {
 
     fun error(text: String) = push(stamp() + " ERR " + text)
 
+    fun gps(text: String) = push(stamp() + " GPS " + text)
+
+    fun cal(text: String) = push(stamp() + " CAL " + text)
+
     fun tx(wire: ByteArray) {
         val plain = if (wire.size == 5 && Proto.u8(wire, 0) == 0xBD) wire else Proto.decrypt(wire)
         push(stamp() + " TX  " + Proto.hex(plain) + "  | " + Proto.describeTx(wire) + "  [wire " + Proto.hex(wire) + "]")
@@ -45,7 +51,9 @@ class LogBook {
     fun rx(wire: ByteArray, m: Proto.Msg) {
         if (m is Proto.Status) {
             val now = SystemClock.elapsedRealtime()
-            if (!m.differsIgnoringTimers(lastStatus) && now - lastStatusLoggedAt < 10_000) {
+            val changed = if (quietStatus) m.differsInState(lastStatus) else m.differsIgnoringTimers(lastStatus)
+            val heartbeat = if (quietStatus) 30_000 else 10_000
+            if (!changed && now - lastStatusLoggedAt < heartbeat) {
                 suppressed++
                 lastStatus = m
                 return
@@ -89,6 +97,6 @@ class LogBook {
     }
 
     companion object {
-        const val MAX = 3000
+        const val MAX = 6000
     }
 }

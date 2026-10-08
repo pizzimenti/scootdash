@@ -32,8 +32,18 @@ object Proto {
     const val REG_ACCEL = 0x08
     const val REG_BRAKE = 0x09
 
-    /** Top-speed (km/h) register for gear 0..3. The stock app only reads these. */
+    /** Speed limit (km/h) register for gear 0..3. The stock app only reads these. The scooter
+     *  answers every write with the value it kept: lower values stick, and anything above 31
+     *  is clamped to 31. Factory values were 6, 12, 18 and 31. */
     val TOP_SPEED_REG = intArrayOf(0xA3, 0xA0, 0xA1, 0xA2)
+
+    /** Gear 0..3 as riding modes. */
+    val MODE_NAMES = arrayOf("Walk", "Run", "Bike", "Drive")
+
+    /** "Drive (gear 3)", for log lines. */
+    fun modeTag(g: Int): String = MODE_NAMES[g] + " (gear " + g + ")"
+
+    const val MI_KM = 1.609344
 
     private val ENC = ByteArray(256)
     private val DEC = ByteArray(256)
@@ -100,13 +110,17 @@ object Proto {
         val flags = u8(plain, 4)
         val gearRaw = u8(plain, 5)
         val gear = when (gearRaw and 0x78) { 0x08 -> 0; 0x10 -> 1; 0x20 -> 2; 0x40 -> 3; else -> -1 }
-        val reserved67 = u16(plain, 6)          // always 0 in the capture; watch under load
-        val speedX10 = u16(plain, 8)            // assumed km/h x10
+        val reserved67 = u16(plain, 6)          // always 0 so far; watch under load
+        /** Speed in the scooter's own display units x10: mph x10 when [unitsFlag] is set.
+         *  Confirmed by a ride: full-throttle speed in each mode equals that mode's km/h limit
+         *  only when read as mph, and the trip counter agrees in thousandths of a mile. */
+        val speedRaw = u16(plain, 8)
         val battery = u8(plain, 10)
         val tripTime = u32(plain, 11)           // counts since power-on (~1.5 s each observed)
         val totalTime = u32(plain, 15)
-        val tripMeters = u32(plain, 19)
-        val odoMeters = u32(plain, 23)
+        /** Trip and odometer in thousandths of the display unit (0.001 mi in mph mode). */
+        val tripRaw = u32(plain, 19)
+        val odoRaw = u32(plain, 23)
         val accel = u8(plain, 27)
         val brake = u8(plain, 28)
 
@@ -115,6 +129,22 @@ object Proto {
         val lock: Boolean get() = flags and 0x04 != 0
         val unitsFlag: Boolean get() = flags and 0x08 != 0
         val zeroStart: Boolean get() = flags and 0x10 != 0
+
+        private val unitKm: Double get() = if (unitsFlag) MI_KM else 1.0
+        val speedKmh: Double get() = speedRaw / 10.0 * unitKm
+        val tripMeters: Double get() = tripRaw * unitKm
+        val odoMeters: Double get() = odoRaw * unitKm
+        val speedUnit: String get() = if (unitsFlag) "mph" else "km/h"
+
+        /** True when anything other than speed, the timers and the distances differs. */
+        fun differsInState(o: Status?): Boolean {
+            if (o == null || o.plain.size != plain.size) return true
+            for (i in 0 until plain.size) {
+                if (i in 8..9 || i in 11..26) continue
+                if (plain[i] != o.plain[i]) return true
+            }
+            return false
+        }
 
         /** True when anything other than the two time counters differs from [o]. */
         fun differsIgnoringTimers(o: Status?): Boolean {
@@ -167,11 +197,11 @@ object Proto {
         val reg = u8(p, 3)
         val v = u8(p, 4)
         for (g in 0 until 4) if (TOP_SPEED_REG[g] == reg) {
-            return if (v == QUERY) "read gear $g top speed" else "WRITE gear $g top speed = $v km/h"
+            return if (v == QUERY) "read " + modeTag(g) + " limit" else "WRITE " + modeTag(g) + " limit = $v km/h"
         }
         if (v == QUERY) return "read register 0x" + hex2(reg)
         return when (reg) {
-            REG_GEAR -> "set gear $v"
+            REG_GEAR -> "set gear $v" + (if (v in 0..3) " (" + MODE_NAMES[v] + ")" else "")
             REG_ACCEL -> "set acceleration $v"
             REG_BRAKE -> "set brake $v"
             REG_CRUISE -> "cruise control " + onOff(v)
@@ -186,17 +216,18 @@ object Proto {
     fun describeRx(m: Msg): String = when (m) {
         is Status -> {
             val sb = StringBuilder()
-            sb.append("status gear=").append(m.gear).append(" spd=").append(m.speedX10)
+            sb.append("status gear=").append(m.gear).append(" spd=").append(m.speedRaw)
+                .append('(').append(String.format(java.util.Locale.US, "%.1f", m.speedRaw / 10.0)).append(m.speedUnit).append(')')
             sb.append(" bat=").append(m.battery).append(" acc=").append(m.accel).append(" brk=").append(m.brake)
             sb.append(" flags=").append(hex2(m.flags)).append(" g=").append(hex2(m.gearRaw))
-            sb.append(" trip=").append(m.tripMeters).append("m odo=").append(m.odoMeters).append('m')
+            sb.append(" trip=").append(m.tripRaw).append(" odo=").append(m.odoRaw).append(if (m.unitsFlag) " (0.001mi)" else " (m)")
             sb.append(" t=").append(m.tripTime).append('/').append(m.totalTime)
             sb.append(" b67=").append(m.reserved67)
             sb.toString()
         }
         is RegReply -> {
             val g = m.gearForTopSpeed
-            if (g >= 0) "gear $g top speed = ${m.value} km/h" else "register 0x" + hex2(m.reg) + " = " + m.value
+            if (g >= 0) modeTag(g) + " limit = ${m.value} km/h" else "register 0x" + hex2(m.reg) + " = " + m.value
         }
         is PwReply -> if (m.accepted) "password accepted" else "password reply 0x" + hex2(m.result)
         else -> "unrecognised frame"
