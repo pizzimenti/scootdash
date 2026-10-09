@@ -143,7 +143,7 @@ kotlinc src/main/kotlin/io/github/pizzimenti/scootdash/Proto.kt test/ProtoTest.k
 java -cp /tmp/pt:$KOTLIN_HOME/lib/kotlin-stdlib.jar ProtoTestKt test/capture_fixture.txt
 ```
 
-## Credits
+## License
 
-Barlow and Barlow Condensed by Jeremy Tribby are used under the SIL Open Font
-License 1.1 (`src/main/assets/fonts/OFL-Barlow.txt`).
+MIT, see [`LICENSE`](LICENSE). Barlow and Barlow Condensed by Jeremy Tribby are used
+under the SIL Open Font License 1.1 (`src/main/assets/fonts/OFL-Barlow.txt`).
